@@ -1,0 +1,351 @@
+from shared.schemas.task import Plan, Task, TaskStatus
+
+
+# ---------------------------------------------------------------------------
+# Custom exception
+# ---------------------------------------------------------------------------
+# A separate exception type allows the orchestrator to distinguish:
+#
+#   "The planner generated an invalid graph"
+#
+# from other unexpected programming/runtime errors.
+#
+# Example:
+#     validate_plan(plan)
+#     -> PlanGraphError if the DAG structure is invalid.
+# ---------------------------------------------------------------------------
+class PlanGraphError(Exception):
+    """Raised when a plan contains invalid graph structure."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Plan validation
+# ---------------------------------------------------------------------------
+# This function validates the STRUCTURE of the plan before execution starts.
+#
+# The planner is responsible for proposing a plan, but the orchestrator owns
+# execution. Therefore, the orchestrator should never execute a plan before
+# checking that its graph is valid.
+#
+# The plan must satisfy:
+#
+#   1. Every task has a unique ID.
+#   2. Every dependency refers to an existing task.
+#   3. A task cannot depend on itself.
+#   4. The graph cannot contain cycles.
+#
+# We collect all validation errors first instead of raising immediately.
+# This gives us a complete error report instead of fixing one problem at a
+# time.
+# ---------------------------------------------------------------------------
+def validate_plan(plan: Plan) -> None:
+
+    # Stores IDs of all tasks that we have encountered.
+    # Used to detect duplicate task IDs.
+    task_ids = set()
+
+    # Stores all validation errors.
+    # We raise one exception at the end containing all of them.
+    errors = []
+
+    # Stores duplicate IDs separately so that we can report them together.
+    duplicates = set()
+
+    # -----------------------------------------------------------------------
+    # 1. Check for duplicate task IDs
+    # -----------------------------------------------------------------------
+    for task in plan.tasks:
+
+        if task.task_id in task_ids:
+            duplicates.add(task.task_id)
+
+        task_ids.add(task.task_id)
+
+    if duplicates:
+        errors.append(
+            f"Duplicate task IDs found: "
+            f"{', '.join(str(task_id) for task_id in duplicates)}"
+        )
+
+    # -----------------------------------------------------------------------
+    # 2. Validate dependencies
+    # -----------------------------------------------------------------------
+    # depends_on contains UUIDs, not Task objects.
+    #
+    # We therefore check each dependency against task_ids to make sure that
+    # the referenced task actually exists in the plan.
+    #
+    # We also check for self-dependencies:
+    #
+    #     A -> A
+    #
+    # which is invalid and is also technically a cycle.
+    # -----------------------------------------------------------------------
+    for task in plan.tasks:
+
+        for dependency in task.depends_on:
+
+            # Dependency refers to a task that doesn't exist.
+            if dependency not in task_ids:
+                errors.append(
+                    f"Task {task.task_id} depends on unknown task {dependency}"
+                )
+
+            # A task cannot depend on itself.
+            if task.task_id == dependency:
+                errors.append(
+                    f"Task {task.task_id} depends on itself {dependency}"
+                )
+
+                # Don't process this dependency again during validation.
+                continue
+
+    # -----------------------------------------------------------------------
+    # 3. Detect cycles using DFS
+    # -----------------------------------------------------------------------
+    # A valid execution graph must be a DAG:
+    #
+    #     Directed Acyclic Graph
+    #
+    # Example of an invalid cycle:
+    #
+    #     A -> B -> C -> A
+    #
+    # We use two sets:
+    #
+    #     visited
+    #         Tasks whose dependency tree has already been completely
+    #         explored.
+    #
+    #     current_path
+    #         Tasks currently being explored in the current DFS path.
+    #
+    # If we encounter a task that already exists in current_path, we have
+    # returned to an ancestor and therefore found a cycle.
+    # -----------------------------------------------------------------------
+
+    visited = set()
+    current_path = set()
+
+    # Dictionary for fast lookup:
+    #
+    #     task_id -> Task
+    #
+    # This avoids repeatedly searching through plan.tasks.
+    task_map = {
+        task.task_id: task
+        for task in plan.tasks
+    }
+
+    def visit(task_id):
+        """
+        Recursively explore the dependency graph starting from task_id.
+        """
+
+        # If the task is already in the current DFS path, we have returned
+        # to a task that is currently being explored.
+        #
+        # Example:
+        #
+        #     A -> B -> C -> A
+        #
+        # When visit(A) happens again, A is already in current_path.
+        if task_id in current_path:
+            errors.append(
+                f"Cycle detected involving task {task_id}"
+            )
+            return
+
+        # This task has already been completely explored.
+        # No need to perform the same work again.
+        if task_id in visited:
+            return
+
+        # Mark this task as part of the current dependency chain.
+        current_path.add(task_id)
+
+        # Get the actual Task object from its ID.
+        task = task_map[task_id]
+
+        # Recursively follow every dependency.
+        for dependency in task.depends_on:
+
+            # Unknown dependencies were already reported above.
+            #
+            # We don't call visit() for them because they don't exist in
+            # task_map and would cause a KeyError.
+            if dependency in task_map:
+                visit(dependency)
+
+        # We have finished exploring this task's dependency tree.
+        # Therefore it is no longer part of the current DFS path.
+        current_path.remove(task_id)
+
+        # Mark it as completely explored so that other branches don't need
+        # to traverse it again.
+        visited.add(task_id)
+
+    # Start DFS from every task.
+    #
+    # We cannot start from only one task because the plan can contain
+    # multiple disconnected graph components:
+    #
+    #     A -> B
+    #
+    #     C -> D
+    #
+    # Both components must be checked.
+    for task_id in task_ids:
+        visit(task_id)
+
+    # -----------------------------------------------------------------------
+    # 4. Report all validation errors
+    # -----------------------------------------------------------------------
+    # If no errors were found, the function simply returns None and the
+    # orchestrator can safely continue with execution.
+    #
+    # If errors exist, raise one exception containing every problem found.
+    # -----------------------------------------------------------------------
+    if errors:
+        raise PlanGraphError(
+            "Plan validation failed:\n- " + "\n- ".join(errors)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Find ready tasks
+# ---------------------------------------------------------------------------
+# A task is READY when:
+#
+#     1. Its own status is PENDING.
+#     2. Every dependency has status DONE.
+#
+# Example:
+#
+#     A -> C
+#     B -> C
+#
+# If A and B are DONE:
+#
+#     A = DONE
+#     B = DONE
+#     C = PENDING
+#
+# then C is ready.
+#
+# This function does NOT execute tasks and does NOT modify their state.
+# It only answers:
+#
+#     "Which tasks are allowed to execute right now?"
+#
+# Keeping this separate from the dispatcher makes the architecture cleaner.
+# ---------------------------------------------------------------------------
+def get_ready_tasks(plan: Plan) -> list[Task]:
+
+    ready_tasks = []
+
+    # Fast lookup:
+    #
+    #     task_id -> Task
+    #
+    # depends_on contains IDs, so we use this map to retrieve the actual
+    # dependency Task and inspect its status.
+    task_map = {
+        task.task_id: task
+        for task in plan.tasks
+    }
+
+    for task in plan.tasks:
+
+        # Only PENDING tasks can become ready.
+        #
+        # DONE, FAILED, IN_PROGRESS, NEEDS_RETRY, and BLOCKED tasks should
+        # not be returned here.
+        if task.status != TaskStatus.PENDING:
+            continue
+
+        # Every dependency must be DONE.
+        #
+        # all([]) is True, which is useful because a task with no
+        # dependencies is immediately ready.
+        dependency_done = all(
+            task_map[dependency].status == TaskStatus.DONE
+            for dependency in task.depends_on
+        )
+
+        if dependency_done:
+            ready_tasks.append(task)
+
+    return ready_tasks
+
+
+# ---------------------------------------------------------------------------
+# Find blocked tasks
+# ---------------------------------------------------------------------------
+# A task is BLOCKED when:
+#
+#     1. The task itself is still PENDING.
+#     2. At least one of its dependencies is FAILED or BLOCKED.
+#
+# Example:
+#
+#     A -> B -> C
+#
+# If:
+#
+#     A = FAILED
+#
+# then B becomes BLOCKED.
+#
+# Once B is marked BLOCKED by the orchestrator, C will also become blocked
+# because C depends on B.
+#
+# IMPORTANT:
+#
+# This function only IDENTIFIES blocked tasks.
+# It does not modify their status.
+#
+# The dispatcher/orchestrator is responsible for doing:
+#
+#     task.update_status(TaskStatus.BLOCKED)
+#
+# Keeping this function read-only makes the graph layer easier to reason
+# about and test.
+# ---------------------------------------------------------------------------
+def get_blocked_tasks(plan: Plan) -> list[Task]:
+
+    blocked_tasks = []
+
+    # Fast lookup:
+    #
+    #     task_id -> Task
+    #
+    task_map = {
+        task.task_id: task
+        for task in plan.tasks
+    }
+
+    for task in plan.tasks:
+
+        # Only PENDING tasks can become blocked.
+        if task.status != TaskStatus.PENDING:
+            continue
+
+        # A task is blocked if ANY dependency has failed or is itself
+        # blocked.
+        #
+        # We use any() rather than all() because one failed dependency is
+        # enough to prevent this task from executing.
+        dependency_block = any(
+            task_map[dependency].status in (
+                TaskStatus.FAILED,
+                TaskStatus.BLOCKED,
+            )
+            for dependency in task.depends_on
+        )
+
+        if dependency_block:
+            blocked_tasks.append(task)
+
+    return blocked_tasks

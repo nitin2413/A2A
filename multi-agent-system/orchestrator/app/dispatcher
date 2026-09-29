@@ -1,0 +1,271 @@
+import asyncio
+
+from shared.schemas.task import Task, TaskStatus, Plan
+from graph import get_ready_tasks
+
+
+# Raised when a task refers to an agent that the dispatcher does not know about.
+#
+# Example:
+#     task.assigned_agent = "researcher"
+#     but "researcher" is not present in self.agents
+#
+# Having a specific exception makes this easier to distinguish from
+# an error that happens while an agent is actually executing.
+class UnknownAgentError(Exception):
+    pass
+
+
+class TaskDispatcher:
+
+    def __init__(self, agents: dict):
+        # The dispatcher receives already-created agents from the orchestrator.
+        #
+        # Example:
+        # {
+        #     "planner": planner_agent,
+        #     "codegen": codegen_agent,
+        #     "critic": critic_agent
+        # }
+        #
+        # This is dependency injection:
+        # the dispatcher does NOT create or configure the agents itself.
+        self.agents = agents
+
+    async def execute_task(self, task: Task):
+        """
+        Execute ONE attempt of a task.
+
+        Important:
+        This method does NOT handle retries.
+        One call = one execution attempt.
+
+        Flow:
+
+            PENDING
+               ↓
+            IN_PROGRESS
+               ↓
+          agent.execute()
+             /     \
+          success  error
+            ↓        ↓
+           DONE    NEEDS_RETRY / FAILED
+        """
+
+        # The task tells us which agent should execute it.
+        agent_name = task.assigned_agent
+
+        # Check that the requested agent actually exists before
+        # accessing the dictionary. Otherwise self.agents[...] would
+        # raise a KeyError.
+        if agent_name not in self.agents:
+            raise UnknownAgentError(
+                f"Unknown agent: {agent_name}"
+            )
+
+        # Get the actual agent implementation.
+        #
+        # The dispatcher doesn't care whether this is Planner,
+        # CodeGen, Critic, Researcher, etc.
+        #
+        # All agents are expected to expose:
+        #
+        #     await agent.execute(task)
+        #
+        agent = self.agents[agent_name]
+
+        # Execution is starting, so move the task from PENDING
+        # to IN_PROGRESS.
+        #
+        # update_status() also updates updated_at.
+        task.update_status(TaskStatus.IN_PROGRESS)
+
+        # Count an attempt only when we actually start execution.
+        #
+        # Example:
+        #   first execution  -> attempt_count = 1
+        #   retry            -> attempt_count = 2
+        #   retry            -> attempt_count = 3
+        task.attempt_count += 1
+
+        try:
+            # Execute the agent asynchronously.
+            #
+            # Because this is async, other tasks can use the event loop
+            # while this agent is waiting for an LLM/network response.
+            result = await agent.execute(task)
+
+            # Store the agent's output in the canonical task output field.
+            task.output_payload = result
+
+            # The execution completed successfully.
+            task.update_status(TaskStatus.DONE)
+
+            return result
+
+        except Exception as e:
+            # Save the error so the task contains information about
+            # why this execution attempt failed.
+            task.error = str(e)
+
+            # We have reached the maximum number of allowed attempts.
+            #
+            # Example:
+            # max_attempts = 3
+            # attempt_count = 3
+            #
+            # No more retries should happen.
+            if task.attempt_count >= task.max_attempts:
+                task.update_status(TaskStatus.FAILED)
+
+            else:
+                # The task failed, but another attempt is allowed.
+                #
+                # dispatch_task() will see this state and retry it.
+                task.update_status(TaskStatus.NEEDS_RETRY)
+
+            # Re-raise the ORIGINAL exception.
+            #
+            # The dispatcher above us can decide what to do with it.
+            # We don't use "raise Exception" because that would lose
+            # the original error information.
+            raise
+
+    async def dispatch_task(self, task: Task):
+        """
+        Execute a task with retry handling.
+
+        execute_task() performs ONE attempt.
+
+        dispatch_task() controls the retry policy.
+
+        Flow:
+
+            execute_task()
+                 ↓
+             success?
+             /      \
+           yes       no
+            ↓         ↓
+          return   NEEDS_RETRY?
+                       /   \
+                     yes    no
+                      ↓      ↓
+                   wait    raise
+                      ↓
+                   retry
+        """
+
+        # Starting with a small value keeps development/testing fast.
+        #
+        # Later this should probably come from configuration.
+        base_delay = 0.1
+
+        # Keep trying until the task succeeds or reaches max_attempts.
+        while True:
+
+            try:
+                # execute_task() performs one execution attempt.
+                return await self.execute_task(task)
+
+            except Exception:
+
+                # execute_task() already decided whether another
+                # attempt is allowed.
+                #
+                # If it says NEEDS_RETRY, wait and try again.
+                if task.status == TaskStatus.NEEDS_RETRY:
+
+                    # Exponential backoff:
+                    #
+                    # attempt 1 → 0.1 seconds
+                    # attempt 2 → 0.2 seconds
+                    # attempt 3 → 0.4 seconds
+                    #
+                    # This prevents immediately hammering an
+                    # unavailable service repeatedly.
+                    delay = base_delay * (
+                        2 ** (task.attempt_count - 1)
+                    )
+
+                    # asyncio.sleep() pauses THIS coroutine without
+                    # blocking the entire event loop.
+                    await asyncio.sleep(delay)
+
+                    # Start another execution attempt.
+                    continue
+
+                # If the task is FAILED, max attempts have been reached.
+                #
+                # Propagate the original exception to the caller.
+                raise
+
+    async def dispatch_ready_tasks(self, plan: Plan):
+        """
+        Execute all currently-ready tasks concurrently.
+
+        The graph layer decides WHICH tasks are ready.
+        The dispatcher decides HOW to execute them.
+
+        Example graph:
+
+            A ──→ C
+            B ──→ C
+
+        Initially:
+            A = PENDING
+            B = PENDING
+            C = PENDING
+
+        get_ready_tasks() returns:
+            [A, B]
+
+        Then both are dispatched concurrently.
+
+        After A and B finish:
+            A = DONE
+            B = DONE
+            C = PENDING
+
+        On the next execution wave, C becomes ready.
+        """
+
+        # Ask the graph layer which tasks are executable right now.
+        ready_tasks = get_ready_tasks(plan)
+
+        # Convert every ready task into a coroutine.
+        #
+        # IMPORTANT:
+        # We do NOT await each task here individually.
+        #
+        # If we did:
+        #
+        #     await self.dispatch_task(A)
+        #     await self.dispatch_task(B)
+        #
+        # then B would wait for A.
+        #
+        # Instead, we create all coroutines first and give them
+        # to asyncio.gather().
+        coroutines = [
+            self.dispatch_task(task)
+            for task in ready_tasks
+        ]
+
+        # Run all ready tasks concurrently and wait for all of them
+        # to finish.
+        #
+        # Example:
+        #
+        #     A ──────┐
+        #             ├── asyncio.gather()
+        #     B ──────┤
+        #             │
+        #     D ──────┘
+        #
+        # A, B and D can execute while waiting for I/O such as
+        # LLM/API/network responses.
+        results = await asyncio.gather(*coroutines)
+
+        return results

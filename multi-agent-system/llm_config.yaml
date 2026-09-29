@@ -1,0 +1,31 @@
+planner : 
+  provider: groq
+  model: openai/gpt-oss-120b
+  api_key_env: GROQ_API_KEY
+#  base_url : OPENROUTER_BASE_URL
+  temperature: 0.2
+  max_tokens: 3000
+
+codegen:
+  provider: groq
+  model: openai/gpt-oss-120b
+  api_key_env: GROQ_API_KEY
+#  base_url : OPENROUTER_BASE_URL
+  temperature: 0.1
+  max_tokens: 4000
+
+critic:
+  provider: groq
+  model: openai/gpt-oss-120b
+  api_key_env: GROQ_API_KEY
+#  base_url : OPENROUTER_BASE_URL
+  temperature: 0.0
+  max_tokens: 3000  
+
+default:
+  provider: groq
+  model: openai/gpt-oss-120b
+  api_key_env: GROQ_API_KEY
+#  base_url : OPENROUTER_BASE_URL
+  temperature: 0.2
+  max_tokens: 3000
