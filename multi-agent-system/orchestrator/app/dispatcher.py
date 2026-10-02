@@ -133,6 +133,7 @@ from shared.schemas.task import (
     TaskStatus,
     PlanStatus,
 )
+from shared.agents.protocol import Agent
 
 
 def update_plan_status(plan: Plan) -> None:
@@ -149,7 +150,7 @@ def update_plan_status(plan: Plan) -> None:
 
 class TaskDispatcher:
 
-    def __init__(self, agents: dict):
+    def __init__(self, agents: dict[str , Agent]):
         self.agents = agents
 
     async def execute_task(self, task: Task):
